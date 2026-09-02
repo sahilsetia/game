@@ -1,0 +1,12 @@
+{
+  "name": "business-india",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": ["shared", "client", "server"],
+  "scripts": {
+    "dev": "npm run dev -w client",
+    "server": "npm run dev -w server",
+    "test": "npm run test -w shared",
+    "build": "npm run build -w client"
+  }
+}
