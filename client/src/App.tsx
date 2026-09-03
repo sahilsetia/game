@@ -69,6 +69,7 @@ export default function App() {
             Play with friends
           </button>
           <button onClick={() => setScreen({ s: 'lobbyJoin', code: '' })}>Join with room code</button>
+          <div style={{fontSize:13, letterSpacing: 1, color:'#bcd2e2'}}>Made by Sahil Setia</div>
         </div>
       </div>
     );
