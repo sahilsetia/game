@@ -24,12 +24,21 @@ import { Dialogs } from '../components/Dialogs';
 import { playStep, playDice, playBuy, playBuild, playSet, playJail, playCoin, playSell } from '../sound';
 import { confettiBurst } from '../fx';
 
+export interface ConnInfo {
+  connected: boolean[];
+  ai: boolean[];
+  deadlines: Record<number, number>;
+}
+
 interface Props {
   game: Game;
   controls: (playerId: number) => boolean;
   dispatch: (a: Action) => void;
   onExit: () => void;
   aiLocal: boolean;
+  conn?: ConnInfo; // online mode: who is connected / computer-controlled
+  selfOffline?: boolean; // online mode: this device lost its connection
+  myId?: number;
 }
 
 interface Banner {
@@ -37,7 +46,8 @@ interface Banner {
   text: string;
 }
 
-const STEP_MS = 300;
+const STEP_MS = 345; // token walk speed (15% slower for readability)
+const AI_DELAY_MS = 1265;
 
 function setsOf(g: Game, playerId: number): number {
   const counts: Record<GroupKey, number> = { lb: 0, mg: 0, yl: 0, gr: 0 };
@@ -48,10 +58,12 @@ function setsOf(g: Game, playerId: number): number {
   return (Object.values(counts) as number[]).filter((c) => c >= 3).length;
 }
 
-export function GameScreen({ game, controls, dispatch, onExit, aiLocal }: Props) {
+export function GameScreen({ game, controls, dispatch, onExit, aiLocal, conn, selfOffline, myId }: Props) {
   const [displayPos, setDisplayPos] = useState<Record<number, number>>({});
   const [animating, setAnimating] = useState(false);
   const [banner, setBanner] = useState<Banner | null>(null);
+  const [diceShow, setDiceShow] = useState<[number, number] | null>(null);
+  const [now, setNow] = useState(Date.now());
   const [inspect, setInspect] = useState<number | null>(null);
   const [recap, setRecap] = useState<string[] | null>(null);
   const [tileInfo, setTileInfo] = useState<number | null>(null);
@@ -98,6 +110,30 @@ export function GameScreen({ game, controls, dispatch, onExit, aiLocal }: Props)
   }, [game, controls]);
 
   useEffect(() => () => timers.current.forEach(clearTimeout), []);
+
+  // Dice tumble: cycle random faces briefly before settling on the real roll.
+  useEffect(() => {
+    if (!game.dice) return;
+    let frames = 0;
+    const iv = window.setInterval(() => {
+      frames += 1;
+      if (frames >= 6) {
+        window.clearInterval(iv);
+        setDiceShow(null); // fall back to the real dice
+      } else {
+        setDiceShow([rollDie(), rollDie()]);
+      }
+    }, 95);
+    return () => window.clearInterval(iv);
+  }, [game.dice]);
+
+  // tick every second while somebody is disconnected (for the takeover countdown)
+  const anyWaiting = conn ? conn.connected.some((c, i) => !c && !conn.ai[i] && !game.players[i].bankrupt) : false;
+  useEffect(() => {
+    if (!anyWaiting) return;
+    const iv = window.setInterval(() => setNow(Date.now()), 500);
+    return () => window.clearInterval(iv);
+  }, [anyWaiting]);
 
   // Watch every state change: animate movement step by step, celebrate buys/builds/sets.
   useEffect(() => {
@@ -168,11 +204,11 @@ export function GameScreen({ game, controls, dispatch, onExit, aiLocal }: Props)
           } else if (e.kind === 'sell') {
             playSell();
           }
-          const t2 = window.setTimeout(() => setBanner(null), 2100);
+          const t2 = window.setTimeout(() => setBanner(null), 2400);
           timers.current.push(t2);
         }, delay);
         timers.current.push(t);
-        delay += 2350;
+        delay += 2700;
       }
     };
 
@@ -225,7 +261,7 @@ export function GameScreen({ game, controls, dispatch, onExit, aiLocal }: Props)
       } else {
         dispatch(aiChooseAction(game));
       }
-    }, 1100);
+    }, AI_DELAY_MS);
     timers.current.push(t);
     return () => clearTimeout(t);
   }, [game, aiLocal, animating, dispatch]);
@@ -277,11 +313,11 @@ export function GameScreen({ game, controls, dispatch, onExit, aiLocal }: Props)
         <div className="panel">
           <h3>Dice {p && `— turn ${p.turns + 1} of ${game.turnLimit}`}</h3>
           <div className="dicebar">
-            <div className={`die ${game.dice ? 'pop' : ''}`} key={`d1-${game.dice?.[0]}-${game.log.length}`}>
-              {game.dice ? game.dice[0] : '–'}
+            <div className={`die ${diceShow ? 'tumble' : game.dice ? 'pop' : ''}`} key={`d1-${game.dice?.[0]}-${game.log.length}`}>
+              {diceShow ? diceShow[0] : game.dice ? game.dice[0] : '–'}
             </div>
-            <div className={`die ${game.dice ? 'pop' : ''}`} key={`d2-${game.dice?.[1]}-${game.log.length}`}>
-              {game.dice ? game.dice[1] : '–'}
+            <div className={`die ${diceShow ? 'tumble' : game.dice ? 'pop' : ''}`} key={`d2-${game.dice?.[1]}-${game.log.length}`}>
+              {diceShow ? diceShow[1] : game.dice ? game.dice[1] : '–'}
             </div>
             {p && game.phase === 'awaitRoll' && myTurn && !animating && !recap && (
               <button className="primary" onClick={() => dispatch({ type: 'roll', d1: rollDie(), d2: rollDie() })}>
@@ -308,7 +344,8 @@ export function GameScreen({ game, controls, dispatch, onExit, aiLocal }: Props)
                   <span className="dot" style={{ background: pl.color }} />
                   <span>
                     {pl.name}
-                    {pl.isAI ? ' 🤖' : ''}
+                    {pl.isAI || conn?.ai[pl.id] ? ' 🤖' : ''}
+                    {conn && !conn.connected[pl.id] && !conn.ai[pl.id] && !pl.bankrupt ? ' 📴' : ''}
                     {pl.bankrupt ? ' (out)' : pl.inJail ? ' 🔒 jail' : ''}
                   </span>
                   <span className="cash">₹{pl.cash}</span>
@@ -503,7 +540,8 @@ export function GameScreen({ game, controls, dispatch, onExit, aiLocal }: Props)
             <h2>While you were waiting…</h2>
             <div className="recap">
               {recap.map((l, i) => (
-                <div key={i} className="recap-line">
+                <div key={i} className={`recap-line ${/sold/i.test(l) ? 'recap-sell' : ''}`}>
+                  {/sold/i.test(l) ? '🏷️ ' : ''}
                   {l}
                 </div>
               ))}
@@ -514,7 +552,46 @@ export function GameScreen({ game, controls, dispatch, onExit, aiLocal }: Props)
           </div>
         </div>
       )}
-      {!animating && !recap && <Dialogs game={game} controls={controls} dispatch={dispatch} onExit={onExit} />}
+      {selfOffline && (
+        <div className="overlay">
+          <div className="dialog" style={{ textAlign: 'center' }}>
+            <div className="spinner" />
+            <h2>Reconnecting…</h2>
+            <div className="hint">
+              Your connection dropped. Hold on — the moment your internet is back you rejoin this game automatically. Your seat is
+              held for 1 minute; after that the computer plays for you until you return.
+            </div>
+          </div>
+        </div>
+      )}
+      {!selfOffline &&
+        (() => {
+          if (!conn) return null;
+          const waiting = game.players.filter((pl) => !pl.bankrupt && !conn.connected[pl.id] && !conn.ai[pl.id] && pl.id !== myId);
+          if (waiting.length === 0) return null;
+          const w = waiting[0];
+          const remain = Math.max(0, Math.ceil(((conn.deadlines[w.id] ?? now) - now) / 1000));
+          const mm = Math.floor(remain / 60);
+          const ss = String(remain % 60).padStart(2, '0');
+          return (
+            <div className="overlay">
+              <div className="dialog" style={{ textAlign: 'center' }}>
+                <div className="spinner" />
+                <h2>Waiting for {waiting.map((x) => x.name).join(' and ')} to reconnect…</h2>
+                <div style={{ fontSize: 34, fontWeight: 800, color: '#1f4e6e' }}>
+                  {mm}:{ss}
+                </div>
+                <div className="hint">
+                  They can rejoin from the same device, the join link, or the room code. If they are not back when the timer ends,
+                  the computer takes their seat and the game continues — they can still rejoin anytime after that.
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+      {!animating && !recap && !selfOffline && !anyWaiting && (
+        <Dialogs game={game} controls={controls} dispatch={dispatch} onExit={onExit} />
+      )}
     </div>
   );
 }

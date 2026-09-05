@@ -1,9 +1,35 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { io, type Socket } from 'socket.io-client';
 import { newGame, applyAction, type Game, type Action } from '@game/shared';
-import { GameScreen } from './screens/GameScreen';
+import { GameScreen, type ConnInfo } from './screens/GameScreen';
 
 const SERVER_URL = (import.meta as any).env?.VITE_SERVER_URL ?? `http://${window.location.hostname}:3005`;
+
+/** saved seat so the player can rejoin a running game after reload / network switch */
+interface Session {
+  code: string;
+  myId: number;
+  key: string;
+}
+const SESSION_KEY = 'bi.session';
+function saveSession(s: Session) {
+  try {
+    localStorage.setItem(SESSION_KEY, JSON.stringify(s));
+  } catch {}
+}
+function loadSession(): Session | null {
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    return raw ? (JSON.parse(raw) as Session) : null;
+  } catch {
+    return null;
+  }
+}
+function clearSession() {
+  try {
+    localStorage.removeItem(SESSION_KEY);
+  } catch {}
+}
 
 type Screen =
   | { s: 'home' }
@@ -11,12 +37,15 @@ type Screen =
   | { s: 'localGame'; game: Game }
   | { s: 'lobbyCreate' }
   | { s: 'lobbyJoin'; code: string }
+  | { s: 'lobbyClaim'; code: string; claimable: { id: number; name: string }[] }
   | { s: 'lobbyWait'; code: string; names: string[]; count: number; myId: number; hostIp?: string | null }
-  | { s: 'onlineGame'; code: string; game: Game; myId: number };
+  | { s: 'onlineGame'; code: string; game: Game; myId: number; conn?: ConnInfo; selfOffline?: boolean };
+
+let socketSingleton: Socket | null = null;
 
 export default function App() {
   const [screen, setScreen] = useState<Screen>({ s: 'home' });
-  const socketRef = useRef<Socket | null>(null);
+  const [session, setSession] = useState<Session | null>(loadSession());
 
   // Deep link: ?join=CODE
   useEffect(() => {
@@ -24,31 +53,83 @@ export default function App() {
     if (code) setScreen({ s: 'lobbyJoin', code: code.toUpperCase() });
   }, []);
 
+  function keepSession(s: Session) {
+    saveSession(s);
+    setSession(s);
+  }
+  function dropSession() {
+    clearSession();
+    setSession(null);
+  }
+
   function socket(): Socket {
-    if (!socketRef.current) {
-      socketRef.current = io(SERVER_URL, { transports: ['websocket', 'polling'] });
-      socketRef.current.on('lobby', (data: { code: string; names: string[]; count: number }) => {
+    if (!socketSingleton) {
+      const sk = io(SERVER_URL, { transports: ['websocket', 'polling'] });
+      socketSingleton = sk;
+      sk.on('lobby', (data: { code: string; names: string[]; count: number }) => {
         setScreen((prev) => {
-          const myId = prev.s === 'lobbyWait' ? prev.myId : (prev as any).myId ?? data.names.length - 1;
+          if (prev.s !== 'lobbyWait' && prev.s !== 'lobbyCreate' && prev.s !== 'lobbyJoin') return prev;
+          const myId = prev.s === 'lobbyWait' ? prev.myId : data.names.length - 1;
           const hostIp = prev.s === 'lobbyWait' ? prev.hostIp : undefined;
           return { s: 'lobbyWait', code: data.code, names: data.names, count: data.count, myId, hostIp };
         });
       });
-      socketRef.current.on('state', (data: { code: string; game: Game }) => {
+      sk.on('state', (data: { code: string; game: Game }) => {
         setScreen((prev) => {
           const myId = prev.s === 'lobbyWait' || prev.s === 'onlineGame' ? prev.myId : 0;
-          return { s: 'onlineGame', code: data.code, game: data.game, myId };
+          const conn = prev.s === 'onlineGame' ? prev.conn : undefined;
+          return { s: 'onlineGame', code: data.code, game: data.game, myId, conn, selfOffline: false };
+        });
+        if (data.game.phase === 'gameOver') dropSession();
+      });
+      sk.on('conn', (data: { code: string; connected: boolean[]; ai: boolean[]; deadlines: Record<number, number> }) => {
+        setScreen((prev) =>
+          prev.s === 'onlineGame' && prev.code === data.code
+            ? { ...prev, conn: { connected: data.connected, ai: data.ai, deadlines: data.deadlines } }
+            : prev,
+        );
+      });
+      sk.on('errorMsg', (msg: string) => alert(msg));
+      // network dropped: show "reconnecting" and reclaim the seat automatically when back
+      sk.on('disconnect', () => {
+        setScreen((prev) => (prev.s === 'onlineGame' ? { ...prev, selfOffline: true } : prev));
+      });
+      sk.on('connect', () => {
+        const s = loadSession();
+        setScreen((prev) => {
+          if (prev.s === 'onlineGame' && s && s.code === prev.code) {
+            sk.emit('rejoin', s, (res: { ok: boolean }) => {
+              if (!res.ok) {
+                clearSession();
+                alert('The game is no longer running on the server.');
+                window.location.href = window.location.pathname;
+              }
+            });
+            return { ...prev, selfOffline: false };
+          }
+          return prev;
         });
       });
-      socketRef.current.on('errorMsg', (msg: string) => alert(msg));
     }
-    return socketRef.current;
+    return socketSingleton;
+  }
+
+  function resume(sess: Session) {
+    socket().emit('rejoin', sess, (res: { ok: boolean; error?: string; code?: string; myId?: number; game?: Game }) => {
+      if (res.ok && res.game) {
+        setScreen({ s: 'onlineGame', code: res.code!, game: res.game, myId: res.myId! });
+      } else {
+        dropSession();
+        alert(res.error ?? 'That game has ended.');
+      }
+    });
   }
 
   const goHome = () => {
     window.history.replaceState(null, '', window.location.pathname);
-    socketRef.current?.disconnect();
-    socketRef.current = null;
+    socketSingleton?.disconnect();
+    socketSingleton = null;
+    setSession(loadSession());
     setScreen({ s: 'home' });
   };
 
@@ -62,6 +143,11 @@ export default function App() {
           <div className="subtitle">AMAZING ENTERTAINMENT FOR WHOLE FAMILY</div>
         </div>
         <div className="menu">
+          {session && (
+            <button className="resume" onClick={() => resume(session)}>
+              ▶ Resume game {session.code}
+            </button>
+          )}
           <button className="primary" onClick={() => setScreen({ s: 'setupLocal' })}>
             Play with computer
           </button>
@@ -69,7 +155,10 @@ export default function App() {
             Play with friends
           </button>
           <button onClick={() => setScreen({ s: 'lobbyJoin', code: '' })}>Join with room code</button>
-          <div style={{fontSize:13, letterSpacing: 1, color:'#bcd2e2'}}>Made by Sahil Setia</div>
+        </div>
+        <div className="credit">
+          <div className="credit-name">Made by Sahil Setia</div>
+          <div className="credit-more">✨ More games coming soon ✨</div>
         </div>
       </div>
     );
@@ -101,7 +190,8 @@ export default function App() {
     return (
       <LobbyCreate
         onCreate={(name, count, turnLimit) => {
-          socket().emit('create', { name, count, turnLimit }, (res: { code: string; hostIp?: string | null }) => {
+          socket().emit('create', { name, count, turnLimit }, (res: { code: string; hostIp?: string | null; id: number; key: string }) => {
+            keepSession({ code: res.code, myId: res.id, key: res.key });
             setScreen({ s: 'lobbyWait', code: res.code, names: [name], count, myId: 0, hostIp: res.hostIp });
           });
         }}
@@ -115,13 +205,53 @@ export default function App() {
       <LobbyJoin
         code={screen.code}
         onJoin={(name, roomCode) => {
-          socket().emit('join', { code: roomCode, name }, (res: { ok: boolean; id?: number; error?: string }) => {
-            if (!res.ok) alert(res.error ?? 'Could not join');
-            else setScreen({ s: 'lobbyWait', code: roomCode, names: [], count: 0, myId: res.id! });
-          });
+          socket().emit(
+            'join',
+            { code: roomCode, name },
+            (res: { ok: boolean; id?: number; key?: string; error?: string; running?: boolean; claimable?: { id: number; name: string }[] }) => {
+              if (res.ok) {
+                keepSession({ code: roomCode, myId: res.id!, key: res.key! });
+                setScreen({ s: 'lobbyWait', code: roomCode, names: [], count: 0, myId: res.id! });
+              } else if (res.running && res.claimable && res.claimable.length > 0) {
+                setScreen({ s: 'lobbyClaim', code: roomCode, claimable: res.claimable });
+              } else {
+                alert(res.error ?? 'Could not join');
+              }
+            },
+          );
         }}
         onBack={goHome}
       />
+    );
+  }
+
+  if (screen.s === 'lobbyClaim') {
+    return (
+      <div className="screen">
+        <div className="card">
+          <h2>Game {screen.code} is running</h2>
+          <div className="hint">These players are away — take a seat back to continue their game:</div>
+          {screen.claimable.map((c) => (
+            <button
+              key={c.id}
+              className="primary"
+              onClick={() => {
+                socket().emit('claim', { code: screen.code, playerId: c.id }, (res: { ok: boolean; error?: string; myId?: number; key?: string; game?: Game }) => {
+                  if (res.ok && res.game) {
+                    keepSession({ code: screen.code, myId: res.myId!, key: res.key! });
+                    setScreen({ s: 'onlineGame', code: screen.code, game: res.game, myId: res.myId! });
+                  } else {
+                    alert(res.error ?? 'Could not rejoin');
+                  }
+                });
+              }}
+            >
+              Rejoin as {c.name}
+            </button>
+          ))}
+          <button onClick={goHome}>Back</button>
+        </div>
+      </div>
     );
   }
 
@@ -150,7 +280,7 @@ export default function App() {
           </a>
           <div className="hint">
             If the link doesn't open on a friend's phone: they can open <b>{link.split('?')[0]}</b> in their browser, tap
-            "Join with room code", and type <b>{screen.code}</b>. Everyone must be on the same Wi-Fi.
+            "Join with room code", and type <b>{screen.code}</b>.
           </div>
           <div>
             {screen.names.map((n, i) => (
@@ -160,9 +290,20 @@ export default function App() {
                 </span>
               </div>
             ))}
-            {screen.count > 0 && <div className="hint">{screen.names.length} of {screen.count} joined — the game starts automatically when everyone is in.</div>}
+            {screen.count > 0 && (
+              <div className="hint">
+                {screen.names.length} of {screen.count} joined — the game starts automatically when everyone is in.
+              </div>
+            )}
           </div>
-          <button onClick={goHome}>Cancel</button>
+          <button
+            onClick={() => {
+              dropSession();
+              goHome();
+            }}
+          >
+            Cancel
+          </button>
         </div>
       </div>
     );
@@ -176,6 +317,9 @@ export default function App() {
         controls={(id) => id === screen.myId}
         dispatch={(a: Action) => socket().emit('action', { code: screen.code, action: a })}
         onExit={goHome}
+        conn={screen.conn}
+        selfOffline={screen.selfOffline}
+        myId={screen.myId}
       />
     );
   }
